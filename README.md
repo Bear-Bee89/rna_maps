@@ -1,5 +1,5 @@
 ## RNA maps
-Authors: charlotte.capitanchik@crick.ac.uk; aram.amalietti@gmail.com
+Authors: charlotte.capitanchik@crick.ac.uk; aram.amalietti@gmail.com anddddddddddddddd leomwilkinson@gmail.com
 
 **Quick Start**
 
