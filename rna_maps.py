@@ -412,11 +412,27 @@ def run_rna_map(de_file, xl_bed, genome_fasta, fai, window, smoothing,
         # rmats['inclusion'] = rmats['inclusion'].apply(lambda x: sum([float(y) for y in x if y != 'NA']) / len(x))
         # replaces with max inclusion
         rmats['inclusion'] = rmats['inclusion'].apply(lambda x: max([float(y) for y in x if y != 'NA']))
-        df_rmats =  rmats.loc[ : ,['chr', 'exonStart_0base', 'exonEnd', 'FDR', 'IncLevelDifference', 'strand', 'inclusion', 
-                                   'upstreamES', 'upstreamEE', 'downstreamES', 'downstreamEE']].rename(
-            columns={'IncLevelDifference': 'dPSI', 'inclusion':'maxPSI'}).reset_index()
-   
+        # First, calculate expression from junction counts
+        ijc_cols = [col for col in rmats.columns if col.startswith('IJC_SAMPLE_')]
+        sjc_cols = [col for col in rmats.columns if col.startswith('SJC_SAMPLE_')]
         
+        def parse_junction_counts(row, columns):
+            """Parse comma-separated junction counts and sum them"""
+            total = 0
+            for col in columns:
+                if pd.notna(row[col]):
+                    values = [float(x) for x in str(row[col]).split(',') if x != '']
+                    total += sum(values)
+            return total
+        
+        rmats['IJC_total'] = rmats.apply(lambda row: parse_junction_counts(row, ijc_cols), axis=1)
+        rmats['SJC_total'] = rmats.apply(lambda row: parse_junction_counts(row, sjc_cols), axis=1)
+        rmats['expression'] = rmats['IJC_total'] + rmats['SJC_total']
+        
+        # Now create df_rmats with the expression column included
+        df_rmats = rmats.loc[:, ['chr', 'exonStart_0base', 'exonEnd', 'FDR', 'IncLevelDifference', 'strand', 'inclusion', 
+                                 'upstreamES', 'upstreamEE', 'downstreamES', 'downstreamEE', 'expression']].rename(
+            columns={'IncLevelDifference': 'dPSI', 'inclusion':'maxPSI'}).reset_index()
         # to deduplicate, first select the most extreme dPSI value for every exon (keep ties, they will be resolved by the hierarchy)
         mask = df_rmats.groupby(['chr', 'exonStart_0base', 'exonEnd', 'strand'])['dPSI'] \
                     .transform(lambda x: abs(x).rank(ascending=False)) < 2
@@ -443,13 +459,40 @@ def run_rna_map(de_file, xl_bed, genome_fasta, fai, window, smoothing,
         df_rmats["category"] = np.select(conditions, choices, default=None)
 
         df_rmats.to_csv(f'{output_dir}/{FILEname}_RMATS_with_categories.tsv', sep="\t")
-
+        
         exon_categories = df_rmats.groupby('category').size()
         #exon_categories.columns = ["name", "exon_number"]
         logging.info("Exons in each category:")
         logging.info(exon_categories)
         logging.info("Total categorised deduplicated exons: " + str(df_rmats.shape[0]))
-
+        # After line 445, add:
+        
+        # Get expression distributions for regulated groups
+        enhanced_expression = df_rmats[df_rmats['category'] == 'enhanced']['expression']
+        silenced_expression = df_rmats[df_rmats['category'] == 'silenced']['expression']
+        
+        # Combine to get overall regulated expression range
+        regulated_expression = pd.concat([enhanced_expression, silenced_expression])
+        
+        # Calculate distribution boundaries
+        # Option A: Use percentiles (recommended)
+        expr_min = regulated_expression.quantile(0.05)  # 5th percentile
+        expr_max = regulated_expression.quantile(0.95)  # 95th percentile
+        
+        # Option B: Use min/max (more stringent)
+        # expr_min = regulated_expression.min()
+        # expr_max = regulated_expression.max()
+        
+        # Option C: Use mean ± 2 standard deviations
+        # expr_mean = regulated_expression.mean()
+        # expr_std = regulated_expression.std()
+        # expr_min = expr_mean - 2 * expr_std
+        # expr_max = expr_mean + 2 * expr_std
+        
+        logging.info(f"Expression range for regulated exons: {expr_min:.1f} - {expr_max:.1f}")
+        logging.info(f"Median expression - Enhanced: {enhanced_expression.median():.1f}, "
+                     f"Silenced: {silenced_expression.median():.1f}")
+        
         ### Some warning messages ###
         if exon_categories.loc["control"] == 0:
             logging.info("Warning! There are no control exons. Try changing thresholds or input file and run again.")
@@ -474,28 +517,76 @@ def run_rna_map(de_file, xl_bed, genome_fasta, fai, window, smoothing,
                 target_count = category_counts['enhanced']
             elif 'silenced' in category_counts:
                 target_count = category_counts['silenced']
-        
-            # Subset control exons
-            if 'control' in category_counts and category_counts['control'] > target_count > 0:
+
+            # Subset control exons with expression-based filtering
+            if 'control' in category_counts and category_counts['control'] > 0 and target_count > 0:
+                # Get control exon indices
                 control_indices = df_rmats[df_rmats['category'] == 'control'].index
-                # Randomly select indices to keep
-                control_indices_to_keep = np.random.choice(control_indices, target_count, replace=False)
-                # Create a mask for rows to drop
+                
+                # NEW: Filter controls by expression level
+                control_expression = df_rmats.loc[control_indices, 'expression']
+                
+                # Get indices of controls within expression range
+                expression_filtered_indices = control_indices[
+                    (control_expression >= expr_min) & 
+                    (control_expression <= expr_max)
+                ]
+                
+                logging.info(f"Controls before expression filtering: {len(control_indices)}")
+                logging.info(f"Controls after expression filtering: {len(expression_filtered_indices)}")
+                
+                # Check if we have enough expression-matched controls
+                if len(expression_filtered_indices) < target_count:
+                    logging.warning(
+                        f"Only {len(expression_filtered_indices)} expression-matched controls available, "
+                        f"but {target_count} needed. Using all available expression-matched controls."
+                    )
+                    control_indices_to_keep = expression_filtered_indices
+                else:
+                    # Randomly sample from expression-matched pool
+                    control_indices_to_keep = np.random.choice(
+                        expression_filtered_indices, 
+                        target_count, 
+                        replace=False
+                    )
+                
+                # Drop non-selected controls
                 drop_mask = df_rmats.index.isin(control_indices) & ~df_rmats.index.isin(control_indices_to_keep)
-                # Drop the rows
                 df_rmats = df_rmats[~drop_mask]
-                logging.info(f"Randomly subsetted control exons from {category_counts['control']} to {target_count}")
-        
-            # Subset constitutive exons if they exist and not excluded
+                logging.info(f"Subsetted control exons from {category_counts['control']} to {len(control_indices_to_keep)}")
+                
+                        
+            # Subset constitutive exons with expression-based filtering
             if not no_constitutive and 'constituitive' in category_counts and category_counts['constituitive'] > target_count > 0:
                 const_indices = df_rmats[df_rmats['category'] == 'constituitive'].index
-                # Randomly select indices to keep
-                const_indices_to_keep = np.random.choice(const_indices, target_count, replace=False)
-                # Create a mask for rows to drop
+                const_expression = df_rmats.loc[const_indices, 'expression']
+                
+                expression_filtered_const = const_indices[
+                    (const_expression >= expr_min) & 
+                    (const_expression <= expr_max)
+                ]
+                
+                logging.info(f"Constitutive before expression filtering: {len(const_indices)}")
+                logging.info(f"Constitutive after expression filtering: {len(expression_filtered_const)}")
+                
+                if len(expression_filtered_const) < target_count:
+                    logging.warning(
+                        f"Only {len(expression_filtered_const)} expression-matched constitutive exons available, "
+                        f"but {target_count} needed. Using all available."
+                    )
+                    const_indices_to_keep = expression_filtered_const
+                else:
+                    const_indices_to_keep = np.random.choice(
+                        expression_filtered_const, 
+                        target_count, 
+                        replace=False
+                    )
+                
                 drop_mask = df_rmats.index.isin(const_indices) & ~df_rmats.index.isin(const_indices_to_keep)
-                # Drop the rows
                 df_rmats = df_rmats[~drop_mask]
-                logging.info(f"Randomly subsetted constitutive exons from {category_counts['constituitive']} to {target_count}")
+                logging.info(f"Subsetted constitutive exons from {category_counts['constituitive']} to {len(const_indices_to_keep)}")
+        
+        
         else:
             logging.info("Subsetting disabled (--no_subset flag provided)")
             # Still need original_counts for legend (no subsetting means original = current)
